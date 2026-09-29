@@ -11,6 +11,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Semaphore
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 
 
@@ -35,10 +36,21 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+    // Ограничитель количества параллельных запросов к внешнему платежному движку
+    private val inFlightRequests = Semaphore(parallelRequests)
 
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        inFlightRequests.acquire()
+        try {
+            performPayment(paymentId, amount, paymentStartedAt)
+        } finally {
+            inFlightRequests.release()
+        }
+    }
+
+    private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
