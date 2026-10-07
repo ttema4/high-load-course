@@ -628,6 +628,17 @@
           ],
           "title": "Income / Expenses amount",
           "type": "stat"
+        },
+        {
+          "title": "Payments in/out/finished rate (custom counters)",
+          "type": "timeseries",
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "targets": [
+            { "expr": "sum(rate(shop_payments_incoming_total{service=~\"$service\"}[30s]))",  "legendFormat": "incoming" },
+            { "expr": "sum(rate(shop_payments_outgoing_total{service=~\"$service\"}[30s]))",  "legendFormat": "outgoing" },
+            { "expr": "sum(rate(shop_payments_finished_total{service=~\"$service\"}[30s])) by (outcome)", "legendFormat": "finished-{{outcome}}" }
+          ],
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 }
         }
       ],
       "title": "General",
