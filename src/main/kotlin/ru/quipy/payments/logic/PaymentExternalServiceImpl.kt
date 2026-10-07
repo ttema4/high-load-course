@@ -44,6 +44,12 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         inFlightRequests.acquire()
         try {
+            if ((deadline - now()) < requestAverageProcessingTime.toMillis() * 2) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(success = false, processedAt = now(), reason = "Deadline unreachable")
+                }
+                return
+            }
             performPayment(paymentId, amount, paymentStartedAt)
         } finally {
             inFlightRequests.release()

@@ -1,5 +1,8 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -36,7 +39,14 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    @Autowired
+    lateinit var meterRegistry: MeterRegistry
+
+    @PostConstruct
+    fun initMetrics() = ExecutorServiceMetrics.monitor(meterRegistry, paymentExecutor, "payment-submission-executor")
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        meterRegistry.counter("shop_payments_incoming_total").increment()
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {

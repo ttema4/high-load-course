@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
@@ -21,8 +22,12 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
+    @Autowired
+    lateinit var meterRegistry: MeterRegistry
+
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         for (account in paymentAccounts) {
+            meterRegistry.counter("shop_payments_outgoing_total", "account", account.name()).increment()
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }

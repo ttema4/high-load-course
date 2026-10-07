@@ -1,5 +1,6 @@
 package ru.quipy.payments.subscribers
 
+import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -24,6 +25,9 @@ class PaymentTransactionsSubscriber {
     @Autowired
     lateinit var subscriptionsManager: AggregateSubscriptionsManager
 
+    @Autowired
+    lateinit var meterRegistry: MeterRegistry
+
     @PostConstruct
     fun init() {
         subscriptionsManager.createSubscriber(
@@ -32,6 +36,7 @@ class PaymentTransactionsSubscriber {
             retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)
         ) {
             `when`(PaymentProcessedEvent::class) { event ->
+                meterRegistry.counter("shop_payments_finished_total", "outcome", if (event.success) "success" else "fail").increment()
                 paymentLog.computeIfAbsent(event.orderId) {
                     CopyOnWriteArrayList()
                 }.add(
