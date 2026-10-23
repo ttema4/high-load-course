@@ -6,13 +6,15 @@ import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import org.springframework.web.server.ResponseStatusException
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -36,7 +38,7 @@ class OrderPayer {
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(200),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.AbortPolicy()
     )
 
     @Autowired
@@ -48,17 +50,21 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         meterRegistry.counter("shop_payments_incoming_total").increment()
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+        try {
+            paymentExecutor.submit {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
+                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            }
+        } catch(e: RejectedExecutionException) {
+            throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Payment queue is full")
         }
         return createdAt
     }
