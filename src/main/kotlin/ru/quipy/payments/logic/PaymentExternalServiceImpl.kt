@@ -35,7 +35,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong()-2, window = Duration.ofSeconds(1))
     // Ограничитель количества параллельных запросов к внешнему платежному движку
     private val inFlightRequests = Semaphore(parallelRequests)
 
