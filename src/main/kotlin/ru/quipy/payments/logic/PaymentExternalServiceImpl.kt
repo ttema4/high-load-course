@@ -2,17 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.DistributionSummary
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -21,6 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -38,14 +42,28 @@ class PaymentExternalSystemAdapterImpl(
     private val processingReserveMillis = maxOf(100L, requestAverageProcessingTime.toMillis() / 2)
     private val processingTimeOneCall = (1_150L + rateLimitPerSec - 1) / rateLimitPerSec
     private val maxAttempts = 4
+    private val attemptTimeoutMillis = 1500L
     private val rateLimiter = SlidingWindowRateLimiter(rate = 1, window = Duration.ofMillis(processingTimeOneCall))
     // Ограничитель количества параллельных запросов к внешнему платежному движку
     private val inFlightRequests = Semaphore(parallelRequests, true)
-
+    private val retriesCounter = meterRegistry.counter("shop.payment.retries", "account", accountName, "service", serviceName)
+    private val httpLatencySummary = DistributionSummary.builder("shop.payment.http.latency.ms")
+        .description("Duration of outgoing payment HTTP requests in milliseconds")
+        .tag("account", accountName)
+        .tag("service", serviceName)
+        .publishPercentiles(0.50, 0.85, 0.90, 0.95, 0.99)
+        .register(meterRegistry)
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        inFlightRequests.acquire()
+        val remainingMillis = deadline - now() - processingReserveMillis
+        if (remainingMillis <= 0 || !inFlightRequests.tryAcquire(remainingMillis, TimeUnit.MILLISECONDS)) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(success = false, processedAt = now(), reason = "Deadline unreachable")
+            }
+            return
+        }
+
         try {
             if (!rateLimiter.tickBlocking(deadlineMillis = deadline - processingReserveMillis)) {
                 paymentESService.update(paymentId) {
@@ -75,30 +93,47 @@ class PaymentExternalSystemAdapterImpl(
         try {
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                header("X-Request-Deadline", deadline.toString())
                 post(emptyBody)
             }.build()
 
             var attempt = 1
             while (true) {
-                if (deadline - now() < processingReserveMillis) {
+                val callTimeoutMillis = deadline - now() - processingReserveMillis
+                if (callTimeoutMillis <= 0) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline unreachable")
                     }
                     return
                 }
 
-                val body = client.newCall(request).execute().use { response ->
-                    try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                val call = client.newCall(request)
+                call.timeout().timeout(minOf(callTimeoutMillis, attemptTimeoutMillis), TimeUnit.MILLISECONDS)
+                if (attempt > 1)
+                    retriesCounter.increment()
+
+                val startedAt = System.nanoTime()
+                val body = try {
+                    call.execute().use { response ->
+                        try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: InterruptedIOException) {
+                            throw e
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}", e)
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
                     }
+                } catch (e: InterruptedIOException) {
+                    logger.warn("[$accountName] Payment attempt timeout for txId: $transactionId, payment: $paymentId, attempt: $attempt", e)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "Request timeout.")
+                } finally {
+                    httpLatencySummary.record((System.nanoTime() - startedAt) / 1_000_000.0)
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, attempt: $attempt")
 
-                if (body.result || body.message != "Temporary error" || attempt >= maxAttempts) {
+                if (body.result || (body.message != "Temporary error" && body.message != "Request timeout.") || attempt >= maxAttempts) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
@@ -119,7 +154,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         } catch (e: Exception) {
             when (e) {
-                is SocketTimeoutException -> {
+                is InterruptedIOException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
